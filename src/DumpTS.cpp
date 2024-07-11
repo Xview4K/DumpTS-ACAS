@@ -198,6 +198,7 @@ void ParseCommandLine(int argc, char* argv[])
 		"CID",
 		"MAXMB",
 		"SKIPMB",
+		"SleepMS",
 		"trackid", 
 		"boxtype", 
 		"destpid", 

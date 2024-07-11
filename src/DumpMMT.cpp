@@ -1251,12 +1251,42 @@ int ProcessMFU(MMT::HeaderCompressedIPPacket* pHeaderCompressedIPPacket, uint32_
 	return pESRepacker->Process(pMFUData, cbMFUData, &data_info);
 }
 
-static A_CAS_ECM_RESULT  ProcessECM(A_CAS_CARD* acas, uint8_t* signaling_data_byte, int data_length)
+static A_CAS_ECM_RESULT  ProcessECM(A_CAS_CARD* acas, uint8_t* signaling_data_byte, int data_length, A_CAS_ID casid, CARD_SCRAMBLEKEY caskey, int sleepms)
 {
 	A_CAS_ECM_RESULT res;
-	int r;
+	int r,i,retry_count=10;
+	uint8_t past_caskey, past_ecm_odd, past_ecm_even;
 
-	r = acas->proc_ecm(acas, &res, signaling_data_byte, data_length);
+	if(sleepms==0){//ACAS exclusive mode
+		r = acas->proc_ecm(acas, &res, signaling_data_byte, data_length);
+		return res;
+	}
+
+	for (i = 0; i < retry_count; i++) {
+		if (i > 0) {
+			//past_caskey = caskey.data[0];
+			past_ecm_odd = res.scramble_key[0];
+			past_ecm_even = res.scramble_key[16];
+		}
+		r = acas->scramble_key(acas, &casid, &caskey);
+		if (r == 0) {
+			r = acas->proc_ecm(acas, &res, signaling_data_byte, data_length);
+		}
+		else {	
+			acas->re_init(acas);
+			r = acas->scramble_key(acas, &casid, &caskey);
+			if (r == 0) {
+			r = acas->proc_ecm(acas, &res, signaling_data_byte, data_length);
+				}
+		}
+		if (i > 0) {
+			if (past_ecm_odd == res.scramble_key[0] && past_ecm_even == res.scramble_key[16]) {
+				return res;
+			}
+		}
+		fprintf(stdout, "Rechecking ACAS ECM");
+		Sleep(sleepms);//200 mili sec
+	}
 
 	return res;// RET_CODE_SUCCESS;
 }
@@ -2077,10 +2107,10 @@ int DumpMMTOneStream()
 			printf("error - failed on A_CAS_CARD::init() : code=%d\n", code);
 		}
 	}
-	r = acas->get_init_status(acas, &is);
-	if (r < 0) {
-		printf("error - INVALID_A_CAS_STATUS");;
-	}
+	//r = acas->get_init_status(acas, &is);
+	//if (r < 0) {
+	//	printf("error - INVALID_A_CAS_STATUS");;
+	//}
 	//may need get_id_a_cas_card
 	acas->get_id(acas, &casid);
 	//don't call show_acas_power_on_control_info
@@ -2254,7 +2284,15 @@ int DumpMMTOneStream()
 		if (ConvertToInt((char*)sp, (char*)ep, i64Val) == true && i64Val >= 0 && i64Val <= UINT16_MAX)
 			skipbytes = (int)i64Val;//in hexadecimal
 	}
-
+	int sleepms = 0;//in mili seconds
+	auto iterSleep = g_params.find("SleepMS");
+	if (iterSleep != g_params.end())
+	{
+		sp = iterSleep->second.c_str();
+		ep = sp + iterSleep->second.length();
+		if (ConvertToInt((char*)sp, (char*)ep, i64Val) == true && i64Val >= 0 && i64Val <= UINT16_MAX)
+			sleepms = (int)i64Val;
+	}
 
 	std::string& szInputFile = g_params["input"];
 	bool bExplicitVideoStreamDump = g_params.find("video") == g_params.end() ? false : true;
@@ -2717,7 +2755,9 @@ int DumpMMTOneStream()
 						size_t size = pHeaderCompressedIPPacket->MMTP_Packet->ptr_encrypted_MPU->payload_data_len;
 						decryption.ProcessData(out.data(), in.data(), size);
 						if (out[0] != 0x00) {
+							past_signaling_data_byte = NULL;
 							printf("Decryption error, Re-insert IC card. packet#:0x%x\n", pHeaderCompressedIPPacket->MMTP_Packet->Packet_sequence_number);
+							goto Skip;
 						}
 
 						nRet=pHeaderCompressedIPPacket->MMTP_Packet->ptr_decrypted_MPU->Unpack((uint8_t*)out.data(), size);//out.data() is copied to ptr_MPU->Data_Units
@@ -2793,9 +2833,11 @@ int DumpMMTOneStream()
 				{
 					data_length = pHeaderCompressedIPPacket->MMTP_Packet->ptr_Messages->data_length;
 					signaling_data_byte = pHeaderCompressedIPPacket->MMTP_Packet->ptr_Messages->getECM();
-					
-					if (*(signaling_data_byte+5) != past_signaling_data_byte) {//The first 4 bytes always same
-						res = ProcessECM(acas, signaling_data_byte, data_length);
+
+					if (*(signaling_data_byte+5) != past_signaling_data_byte ) {//The first 4 bytes always same
+						uint8_t past_scramble_key_odd = res.scramble_key[0];
+						uint8_t past_scramble_key_even = res.scramble_key[16];
+						res = ProcessECM(acas, signaling_data_byte, data_length, casid, caskey, sleepms);
 						past_signaling_data_byte = *(signaling_data_byte+5);
 					}
 					pHeaderCompressedIPPacket->MMTP_Packet->ptr_Messages->deleteECM();
@@ -3071,7 +3113,7 @@ int DumpMMTOneStream()
 	}
 
 	//Close IC card
-	acas->release;
+	acas->release(acas);
 
 	auto end_time = std::chrono::high_resolution_clock::now();
 
